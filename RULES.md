@@ -9,7 +9,7 @@ Plan basics (no external schema needed)
 ---------------------------------------
 - The plan is a JSON DAG (`.atp.json`) with `nodes` keyed by ID.
 - Each node includes: `title`, `instruction`, `dependencies` (array of parent IDs), `status` (`LOCKED|READY|CLAIMED|COMPLETED|FAILED`).
-- Optional fields: `context`, `artifacts` (paths you touched), `report` (handoff), `started_at`, `completed_at`.
+- Optional fields: `context`, `reasoning_effort` (`minimal|low|medium|high|xhigh`), `artifacts` (paths you touched), `report` (handoff), `started_at`, `completed_at`.
 - A node becomes `READY` only when all dependencies are `COMPLETED`.
 - If a task is decomposed, it becomes a `SCOPE` and auto-completes after its child tasks complete.
 - Choose the `CODEX` worker_id

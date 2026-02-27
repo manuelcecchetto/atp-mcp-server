@@ -60,6 +60,12 @@
               "enum": ["LOCKED", "READY", "CLAIMED", "COMPLETED", "FAILED"],
               "default": "LOCKED"
             },
+            "reasoning_effort": {
+              "type": "string",
+              "enum": ["minimal", "low", "medium", "high", "xhigh"],
+              "default": "medium",
+              "description": "Preferred reasoning depth for this node. Use lower effort for routine operational work and higher effort for complex architecture or risk-heavy work."
+            },
             "worker_id": {
               "type": "string"
             },

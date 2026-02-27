@@ -58,7 +58,7 @@ Resource
 Graph contract
 --------------
 
-- Keep the plan as a valid task DAG: each node has `title`, `instruction`, `dependencies`, `status` (`LOCKED|READY|CLAIMED|COMPLETED|FAILED`), plus optional `context`, `artifacts`, `report`, timestamps.
+- Keep the plan as a valid task DAG: each node has `title`, `instruction`, `dependencies`, `status` (`LOCKED|READY|CLAIMED|COMPLETED|FAILED`), plus optional `context`, `reasoning_effort` (`minimal|low|medium|high|xhigh`), `artifacts`, `report`, timestamps.
 - Node statuses: `LOCKED` (waiting), `READY`, `CLAIMED`, `COMPLETED`, `FAILED`. The server will auto-release CLAIMED tasks after the lease window and auto-complete SCOPE nodes produced by `atp_decompose_task` once all `scope_children` finish.
 - Dependency integrity is checked on every read/write; missing node references will raise errors instead of silently mutating the file.
 
