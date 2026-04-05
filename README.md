@@ -40,14 +40,17 @@ Environment knobs
 - `ATP_FILE`: path to the ATP plan file (default `.atp.json`).
 - `ATP_LOCK_FILE`: override the lock file path (defaults to `<ATP_FILE>.lock`).
 - `ATP_LEASE_SECONDS`: duration before a claimed task is released (default 600s).
+- Every mutating tool appends an audit event to `<plan>.audit.jsonl`.
 - Tools accept `plan_path` directly; the env vars mainly backstop the status resource or when clients omit the argument.
 
 Available tools
 ---------------
 
 - `atp_claim_task(plan_path, agent_id)`: Assigns the highest-priority READY node, recovers zombies, and returns dependency context. Re-enters an existing claim for the same agent.
-- `atp_complete_task(plan_path, node_id, report, artifacts=[], status="DONE")`: Marks a task DONE or FAILED, clears the lease, and unlocks children whose dependencies are satisfied.
+- `atp_complete_task(plan_path, node_id, report, artifacts=[], status="DONE")`: Marks a CLAIMED task DONE or FAILED, clears the lease, and unlocks children whose dependencies are satisfied.
 - `atp_decompose_task(plan_path, parent_id, subtasks)`: Converts a task into a SCOPE with a new subgraph. Subtasks must form a DAG; start nodes inherit the parent’s original dependencies. The parent closes automatically once all new tasks complete.
+- `atp_reset_task(plan_path, node_id, reason)`: Resets a FAILED task back to READY for retry.
+- `atp_cancel_task(plan_path, node_id, reason)`: Marks a task CANCELLED and leaves its dependents blocked until the graph is revised.
 - `atp_read_graph(plan_path, view_mode="full" | "local", node_id=None)`: Returns the full JSON graph or a neighborhood view around `node_id`.
 
 Resource
@@ -58,13 +61,16 @@ Resource
 Graph contract
 --------------
 
-- Keep the plan as a valid task DAG: each node has `title`, `instruction`, `dependencies`, `status` (`LOCKED|READY|CLAIMED|COMPLETED|FAILED`), plus optional `context`, `reasoning_effort` (`minimal|low|medium|high|xhigh`), `artifacts`, `report`, timestamps.
-- Node statuses: `LOCKED` (waiting), `READY`, `CLAIMED`, `COMPLETED`, `FAILED`. The server will auto-release CLAIMED tasks after the lease window and auto-complete SCOPE nodes produced by `atp_decompose_task` once all `scope_children` finish.
+- Keep the plan as a valid task DAG: each node has `title`, `instruction`, `dependencies`, `status` (`LOCKED|READY|CLAIMED|COMPLETED|FAILED|CANCELLED`), plus optional `priority` (integer), `context`, `reasoning_effort` (`minimal|low|medium|high|xhigh`), `artifacts`, `report`, timestamps.
+- Node statuses: `LOCKED` (waiting), `READY`, `CLAIMED`, `COMPLETED`, `FAILED`, `CANCELLED`. The server will auto-release stale CLAIMED tasks after the lease window and auto-complete SCOPE nodes produced by `atp_decompose_task` once all `scope_children` finish.
+- READY task selection is sorted by `(-priority, len(dependencies), node_id)`.
+- Reads and writes are guarded by the same file lock, and plan writes use a `.tmp` file plus `os.replace()` for atomic replacement.
 - Dependency integrity is checked on every read/write; missing node references will raise errors instead of silently mutating the file.
 
 Testing
 -------
 
+- `uv run --with pytest pytest`
 - `python3 -m compileall main.py`
 
 MCP client config example

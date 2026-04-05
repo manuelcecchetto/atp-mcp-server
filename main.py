@@ -5,7 +5,7 @@ import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from filelock import FileLock
 from jsonschema import Draft7Validator
@@ -20,7 +20,7 @@ SCHEMA_PATH = Path(__file__).with_name("atp_schema.json")
 
 def _load_validator() -> Draft7Validator:
     try:
-        schema = json.loads(SCHEMA_PATH.read_text())
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise RuntimeError(
             f"Missing schema file at {SCHEMA_PATH}. Ensure atp_schema.json is present."
@@ -85,24 +85,71 @@ def load_graph(plan_file: Path) -> Dict:
         raise FileNotFoundError(
             f"No ATP graph found at {plan_file}. Create a file matching atp_schema.json."
         )
-    data = json.loads(plan_file.read_text())
+    data = json.loads(plan_file.read_text(encoding="utf-8"))
     validate_graph(data)
     return data
 
 
 def save_graph(graph: Dict, plan_file: Path) -> None:
     validate_graph(graph)
-    plan_file.write_text(json.dumps(graph, indent=2) + "\n")
+    payload = json.dumps(graph, indent=2) + "\n"
+    tmp_file = plan_file.with_name(f"{plan_file.name}.tmp")
+    try:
+        with tmp_file.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_file, plan_file)
+    finally:
+        if tmp_file.exists():
+            tmp_file.unlink(missing_ok=True)
+
+
+def audit_log_path(plan_file: Path) -> Path:
+    return Path(f"{plan_file}.audit.jsonl")
+
+
+def append_audit_events(plan_file: Path, events: List[Dict[str, Any]]) -> None:
+    if not events:
+        return
+    with audit_log_path(plan_file).open("a", encoding="utf-8") as handle:
+        for event in events:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def build_audit_event(action: str, now: datetime, **payload: Any) -> Dict[str, Any]:
+    return {
+        "action": action,
+        "timestamp": isoformat(now),
+        **payload,
+    }
 
 
 @contextmanager
-def locked_graph(plan_path: str) -> Iterable[Dict]:
-    plan_file, lock_file = resolve_paths(plan_path)
+def graph_lock(
+    plan_path: Optional[str] = None, *, resolved: Optional[Tuple[Path, Path]] = None
+) -> Iterable[Path]:
+    plan_file, lock_file = resolved or resolve_paths(plan_path)
     lock = FileLock(str(lock_file))
     with lock:
+        yield plan_file
+
+
+def read_graph_locked(
+    plan_path: Optional[str] = None, *, resolved: Optional[Tuple[Path, Path]] = None
+) -> Dict:
+    with graph_lock(plan_path, resolved=resolved) as plan_file:
+        return load_graph(plan_file)
+
+
+@contextmanager
+def locked_graph(plan_path: Optional[str]) -> Iterable[Tuple[Dict, Path, List[Dict[str, Any]]]]:
+    with graph_lock(plan_path) as plan_file:
         graph = load_graph(plan_file)
-        yield graph
+        audit_events: List[Dict[str, Any]] = []
+        yield graph, plan_file, audit_events
         save_graph(graph, plan_file)
+        append_audit_events(plan_file, audit_events)
 
 
 def dependencies_satisfied(nodes: Dict[str, Dict], dependencies: List[str]) -> bool:
@@ -152,7 +199,7 @@ def maybe_complete_scopes(graph: Dict, now: datetime) -> List[str]:
     for node_id, node in nodes.items():
         if node.get("type") != "SCOPE":
             continue
-        if node["status"] in {"COMPLETED", "FAILED"}:
+        if node["status"] in {"COMPLETED", "FAILED", "CANCELLED"}:
             continue
         children = node.get("scope_children", [])
         missing = [child for child in children if child not in nodes]
@@ -174,6 +221,14 @@ def clear_worker(node: Dict) -> None:
     # Remove worker assignment for schema compatibility (worker_id is an optional string).
     node.pop("worker_id", None)
     node["lease_expires_at"] = None
+
+
+def reset_runtime_fields(node: Dict) -> None:
+    clear_worker(node)
+    node.pop("started_at", None)
+    node.pop("completed_at", None)
+    node["artifacts"] = []
+    node["report"] = ""
 
 
 def format_dependency_context(nodes: Dict[str, Dict], node: Dict) -> str:
@@ -223,7 +278,13 @@ def claim_ready_nodes(graph: Dict, agent_id: str, now: datetime) -> Tuple[Option
     if not ready_nodes:
         return None, "NO_TASKS_AVAILABLE: All tasks are blocked, claimed, or the project is finished."
 
-    ready_nodes.sort(key=lambda item: (len(item[1].get("dependencies", [])), item[0]))
+    ready_nodes.sort(
+        key=lambda item: (
+            -int(item[1].get("priority", 0)),
+            len(item[1].get("dependencies", [])),
+            item[0],
+        )
+    )
     node_id, node = ready_nodes[0]
     node["status"] = "CLAIMED"
     node["worker_id"] = agent_id
@@ -238,7 +299,7 @@ def atp_claim_task(plan_path: str, agent_id: str) -> str:
     Requests the next available task. Handles zombie recovery and re-entry.
     """
     now = utc_now()
-    with locked_graph(plan_path) as graph:
+    with locked_graph(plan_path) as (graph, _, audit_events):
         if not project_active(graph):
             status = graph.get("meta", {}).get("project_status")
             return f"Project is not ACTIVE (status={status}). Resume the project before claiming work."
@@ -248,6 +309,24 @@ def atp_claim_task(plan_path: str, agent_id: str) -> str:
         closed_scopes = maybe_complete_scopes(graph, now)
         scope_unblocked = refresh_ready_nodes(graph)
         node_id, message = claim_ready_nodes(graph, agent_id, now)
+
+        if revived:
+            audit_events.append(
+                build_audit_event("zombie_recovery", now, recovered_nodes=revived)
+            )
+        if node_id:
+            audit_events.append(
+                build_audit_event(
+                    "task_claimed",
+                    now,
+                    agent_id=agent_id,
+                    node_id=node_id,
+                    recovered_nodes=revived,
+                    newly_ready=unblocked,
+                    completed_scopes=closed_scopes,
+                    ready_after_scope=scope_unblocked,
+                )
+            )
 
     if node_id:
         return message
@@ -291,15 +370,15 @@ def atp_complete_task(
     now = utc_now()
     new_status = normalize_completion_status(status)
 
-    with locked_graph(plan_path) as graph:
+    with locked_graph(plan_path) as (graph, _, audit_events):
         nodes = graph["nodes"]
         if node_id not in nodes:
             raise ValueError(f"Node {node_id} does not exist.")
         node = nodes[node_id]
         if node.get("type") == "SCOPE":
             raise ValueError("Scope nodes close automatically once their children are done.")
-        if node["status"] not in {"CLAIMED", "READY"}:
-            raise ValueError(f"Node {node_id} is not in progress; current status={node['status']}.")
+        if node["status"] != "CLAIMED":
+            raise ValueError(f"Node {node_id} must be CLAIMED before completion; current status={node['status']}.")
 
         node["status"] = new_status
         node["report"] = report.strip()
@@ -308,12 +387,33 @@ def atp_complete_task(
         clear_worker(node)
 
         if new_status == "FAILED":
+            audit_events.append(
+                build_audit_event(
+                    "task_completed",
+                    now,
+                    node_id=node_id,
+                    status=new_status,
+                    artifacts=node["artifacts"],
+                    report=node["report"],
+                )
+            )
             return f"Task {node_id} marked as FAILED. Dependent tasks remain blocked."
 
         unblocked = refresh_ready_nodes(graph)
         closed_scopes = maybe_complete_scopes(graph, now)
         ready_after_parent = refresh_ready_nodes(graph)
         newly_ready = list(dict.fromkeys(unblocked + closed_scopes + ready_after_parent))
+        audit_events.append(
+            build_audit_event(
+                "task_completed",
+                now,
+                node_id=node_id,
+                status=new_status,
+                artifacts=node["artifacts"],
+                report=node["report"],
+                newly_ready=newly_ready,
+            )
+        )
 
     if newly_ready:
         return f"Task {node_id} completed. Newly READY: {', '.join(newly_ready)}."
@@ -333,25 +433,35 @@ def validate_subtasks(subtasks: List[Dict]) -> None:
             raise ValueError(
                 f"Subtask {task['id']} has dependencies that are not in the subgraph: {', '.join(unknown)}"
             )
+        priority = task.get("priority")
+        if priority is not None and (not isinstance(priority, int) or isinstance(priority, bool)):
+            raise ValueError(f"Subtask {task['id']} priority must be an integer.")
     if not subtasks:
         raise ValueError("Provide at least one subtask.")
 
     adjacency: Dict[str, List[str]] = {task["id"]: task.get("dependencies", []) for task in subtasks}
     visited: Dict[str, str] = {}
 
-    def dfs(node_id: str) -> None:
-        visited[node_id] = "VISITING"
-        for dep in adjacency.get(node_id, []):
-            state = visited.get(dep)
+    for root_id in adjacency:
+        if visited.get(root_id) is not None:
+            continue
+        visited[root_id] = "VISITING"
+        stack: List[Tuple[str, Any]] = [(root_id, iter(adjacency.get(root_id, [])))]
+        while stack:
+            node_id, deps_iter = stack[-1]
+            try:
+                dep_id = next(deps_iter)
+            except StopIteration:
+                visited[node_id] = "VISITED"
+                stack.pop()
+                continue
+
+            state = visited.get(dep_id)
             if state == "VISITING":
                 raise ValueError("Subtasks contain a cycle.")
             if state is None:
-                dfs(dep)
-        visited[node_id] = "VISITED"
-
-    for node_id in adjacency:
-        if visited.get(node_id) is None:
-            dfs(node_id)
+                visited[dep_id] = "VISITING"
+                stack.append((dep_id, iter(adjacency.get(dep_id, []))))
 
 
 def graft_subgraph(
@@ -386,6 +496,7 @@ def graft_subgraph(
             "dependencies": deps,
             "status": "LOCKED",
             "artifacts": [],
+            "priority": task.get("priority", parent.get("priority", 0)),
         }
         if task.get("context"):
             node_payload["context"] = task["context"]
@@ -412,7 +523,7 @@ def atp_decompose_task(plan_path: str, parent_id: str, subtasks: List[Dict]) -> 
     Decomposes a task into a new subgraph and converts the parent into a scope.
     """
     now = utc_now()
-    with locked_graph(plan_path) as graph:
+    with locked_graph(plan_path) as (graph, _, audit_events):
         nodes = graph["nodes"]
         if parent_id not in nodes:
             raise ValueError(f"Node {parent_id} does not exist.")
@@ -425,6 +536,17 @@ def atp_decompose_task(plan_path: str, parent_id: str, subtasks: List[Dict]) -> 
         start_nodes, end_nodes = graft_subgraph(graph, parent_id, subtasks, now)
         closed_scopes = maybe_complete_scopes(graph, now)
         refresh_ready_nodes(graph)
+        audit_events.append(
+            build_audit_event(
+                "task_decomposed",
+                now,
+                parent_id=parent_id,
+                subtask_ids=[task["id"] for task in subtasks],
+                start_nodes=start_nodes,
+                end_nodes=end_nodes,
+                completed_scopes=closed_scopes,
+            )
+        )
 
     return (
         "Decomposition successful. Parent converted to SCOPE and will close after children finish. "
@@ -436,7 +558,14 @@ def atp_decompose_task(plan_path: str, parent_id: str, subtasks: List[Dict]) -> 
 
 def summarize_status(graph: Dict) -> str:
     nodes = graph.get("nodes", {})
-    counts: Dict[str, int] = {"LOCKED": 0, "READY": 0, "CLAIMED": 0, "COMPLETED": 0, "FAILED": 0}
+    counts: Dict[str, int] = {
+        "LOCKED": 0,
+        "READY": 0,
+        "CLAIMED": 0,
+        "COMPLETED": 0,
+        "FAILED": 0,
+        "CANCELLED": 0,
+    }
     claimed: List[str] = []
     for node_id, node in nodes.items():
         status = node["status"]
@@ -449,7 +578,10 @@ def summarize_status(graph: Dict) -> str:
     )
     lines = [
         headline,
-        f"READY: {counts['READY']} | CLAIMED: {counts['CLAIMED']} | COMPLETED: {counts['COMPLETED']} | FAILED: {counts['FAILED']}",
+        (
+            f"READY: {counts['READY']} | CLAIMED: {counts['CLAIMED']} | COMPLETED: {counts['COMPLETED']} "
+            f"| FAILED: {counts['FAILED']} | CANCELLED: {counts['CANCELLED']}"
+        ),
     ]
     if claimed:
         lines.append("Claimed tasks:")
@@ -467,7 +599,7 @@ def status_summary() -> str:
     Lightweight status dashboard for humans/agents.
     """
     try:
-        graph = load_graph(DEFAULT_PLAN_FILE)
+        graph = read_graph_locked(resolved=(DEFAULT_PLAN_FILE, DEFAULT_LOCK_FILE))
     except FileNotFoundError as exc:
         return str(exc)
     except ValidationError as exc:
@@ -502,7 +634,7 @@ def atp_read_graph(plan_path: str, view_mode: str = "full", node_id: Optional[st
     """
     Returns either the full graph JSON or a narrow neighborhood view.
     """
-    graph = load_graph(resolve_paths(plan_path)[0])
+    graph = read_graph_locked(plan_path)
     if view_mode == "full":
         return json.dumps(graph, indent=2)
     if view_mode == "local":
@@ -510,6 +642,75 @@ def atp_read_graph(plan_path: str, view_mode: str = "full", node_id: Optional[st
             raise ValueError("node_id is required for local view.")
         return render_local_view(graph, node_id)
     raise ValueError("view_mode must be 'full' or 'local'.")
+
+
+@mcp.tool()
+def atp_reset_task(plan_path: str, node_id: str, reason: str) -> str:
+    """
+    Resets a FAILED node back to READY so it can be claimed again.
+    """
+    now = utc_now()
+    with locked_graph(plan_path) as (graph, _, audit_events):
+        nodes = graph["nodes"]
+        if node_id not in nodes:
+            raise ValueError(f"Node {node_id} does not exist.")
+        node = nodes[node_id]
+        if node.get("type") == "SCOPE":
+            raise ValueError("Scope nodes cannot be reset manually.")
+        if node["status"] != "FAILED":
+            raise ValueError(f"Node {node_id} must be FAILED to reset; current status={node['status']}.")
+
+        node["status"] = "READY"
+        reset_runtime_fields(node)
+        audit_events.append(
+            build_audit_event(
+                "task_reset",
+                now,
+                node_id=node_id,
+                from_status="FAILED",
+                to_status="READY",
+                reason=reason.strip(),
+            )
+        )
+
+    return f"Task {node_id} reset to READY. Reason recorded: {reason.strip() or '(none)'}."
+
+
+@mcp.tool()
+def atp_cancel_task(plan_path: str, node_id: str, reason: str) -> str:
+    """
+    Cancels a node and leaves its dependents blocked until the graph is changed.
+    """
+    now = utc_now()
+    with locked_graph(plan_path) as (graph, _, audit_events):
+        nodes = graph["nodes"]
+        if node_id not in nodes:
+            raise ValueError(f"Node {node_id} does not exist.")
+        node = nodes[node_id]
+        if node.get("type") == "SCOPE":
+            raise ValueError("Scope nodes cannot be cancelled manually.")
+        if node["status"] in {"COMPLETED", "CANCELLED"}:
+            raise ValueError(f"Node {node_id} cannot be cancelled from status={node['status']}.")
+
+        previous_status = node["status"]
+        node["status"] = "CANCELLED"
+        clear_worker(node)
+        node["completed_at"] = isoformat(now)
+        audit_events.append(
+            build_audit_event(
+                "task_cancelled",
+                now,
+                node_id=node_id,
+                from_status=previous_status,
+                to_status="CANCELLED",
+                reason=reason.strip(),
+            )
+        )
+
+    return (
+        f"Task {node_id} cancelled. Dependents remain blocked until the graph is updated. "
+        f"Reason recorded: {reason.strip() or '(none)'}."
+    )
 
 
 if __name__ == "__main__":
