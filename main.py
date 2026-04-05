@@ -16,6 +16,7 @@ mcp = FastMCP("ATP Librarian")
 
 LEASE_SECONDS = int(os.environ.get("ATP_LEASE_SECONDS", "600"))
 SCHEMA_PATH = Path(__file__).with_name("atp_schema.json")
+TERMINAL_STATUSES = {"COMPLETED", "FAILED", "CANCELLED"}
 
 
 def _load_validator() -> Draft7Validator:
@@ -60,7 +61,7 @@ def resolve_paths(plan_path: Optional[str]) -> Tuple[Path, Path]:
 DEFAULT_PLAN_FILE, DEFAULT_LOCK_FILE = resolve_paths(None)
 
 
-def ensure_dependencies_exist(graph: Dict) -> None:
+def ensure_dependencies_exist(graph: Dict, exception_cls: type[Exception] = ValueError) -> None:
     nodes = graph.get("nodes", {})
     missing: List[Tuple[str, str]] = []
     for node_id, node in nodes.items():
@@ -69,7 +70,35 @@ def ensure_dependencies_exist(graph: Dict) -> None:
                 missing.append((node_id, dep))
     if missing:
         pairs = ", ".join(f"{nid}->{dep}" for nid, dep in missing)
-        raise ValueError(f"Graph references missing dependencies: {pairs}")
+        raise exception_cls(f"Graph references missing dependencies: {pairs}")
+
+
+def ensure_acyclic(
+    adjacency: Dict[str, List[str]], label: str, exception_cls: type[Exception] = ValueError
+) -> None:
+    visited: Dict[str, str] = {}
+    verb = "contain" if label.endswith("s") else "contains"
+
+    for root_id in adjacency:
+        if visited.get(root_id) is not None:
+            continue
+        visited[root_id] = "VISITING"
+        stack: List[Tuple[str, Any]] = [(root_id, iter(adjacency.get(root_id, [])))]
+        while stack:
+            node_id, deps_iter = stack[-1]
+            try:
+                dep_id = next(deps_iter)
+            except StopIteration:
+                visited[node_id] = "VISITED"
+                stack.pop()
+                continue
+
+            state = visited.get(dep_id)
+            if state == "VISITING":
+                raise exception_cls(f"{label} {verb} a cycle.")
+            if state is None:
+                visited[dep_id] = "VISITING"
+                stack.append((dep_id, iter(adjacency.get(dep_id, []))))
 
 
 def validate_graph(graph: Dict) -> None:
@@ -77,7 +106,12 @@ def validate_graph(graph: Dict) -> None:
     if errors:
         error = errors[0]
         raise ValidationError(f"{list(error.path)}: {error.message}")
-    ensure_dependencies_exist(graph)
+    ensure_dependencies_exist(graph, ValidationError)
+    adjacency = {
+        node_id: list(node.get("dependencies", []))
+        for node_id, node in graph.get("nodes", {}).items()
+    }
+    ensure_acyclic(adjacency, "Graph", ValidationError)
 
 
 def load_graph(plan_file: Path) -> Dict:
@@ -193,24 +227,71 @@ def release_zombie_claims(graph: Dict, now: datetime) -> List[str]:
     return revived
 
 
-def maybe_complete_scopes(graph: Dict, now: datetime) -> List[str]:
-    closed: List[str] = []
+def desired_scope_status(nodes: Dict[str, Dict], node_id: str, node: Dict) -> str:
+    children = node.get("scope_children", [])
+    missing = [child for child in children if child not in nodes]
+    if missing:
+        raise ValueError(f"Scope {node_id} references missing children: {', '.join(missing)}")
+    if not children:
+        return "CLAIMED"
+
+    child_statuses = [nodes[child]["status"] for child in children]
+    if any(status in {"LOCKED", "READY", "CLAIMED"} for status in child_statuses):
+        return "CLAIMED"
+    if all(status == "COMPLETED" for status in child_statuses):
+        return "COMPLETED"
+    if all(status in TERMINAL_STATUSES for status in child_statuses):
+        if any(status == "FAILED" for status in child_statuses):
+            return "FAILED"
+        if any(status == "CANCELLED" for status in child_statuses):
+            return "CANCELLED"
+    return "CLAIMED"
+
+
+def recompute_scope_statuses(
+    graph: Dict,
+    now: datetime,
+    audit_events: Optional[List[Dict[str, Any]]] = None,
+    *,
+    agent_id: Optional[str] = None,
+    trigger: Optional[str] = None,
+) -> List[Tuple[str, str, str]]:
+    transitions: List[Tuple[str, str, str]] = []
     nodes = graph["nodes"]
-    for node_id, node in nodes.items():
-        if node.get("type") != "SCOPE":
-            continue
-        if node["status"] in {"COMPLETED", "FAILED", "CANCELLED"}:
-            continue
-        children = node.get("scope_children", [])
-        missing = [child for child in children if child not in nodes]
-        if missing:
-            raise ValueError(f"Scope {node_id} references missing children: {', '.join(missing)}")
-        if children and all(nodes[child]["status"] == "COMPLETED" for child in children):
-            node["status"] = "COMPLETED"
-            node["completed_at"] = isoformat(now)
+
+    changed = True
+    while changed:
+        changed = False
+        for node_id, node in nodes.items():
+            if node.get("type") != "SCOPE":
+                continue
+            current_status = node["status"]
+            target_status = desired_scope_status(nodes, node_id, node)
+            if current_status == target_status:
+                continue
+
+            node["status"] = target_status
             clear_worker(node)
-            closed.append(node_id)
-    return closed
+            if target_status == "CLAIMED":
+                node.pop("completed_at", None)
+            else:
+                node["completed_at"] = isoformat(now)
+
+            transitions.append((node_id, current_status, target_status))
+            if audit_events is not None:
+                payload: Dict[str, Any] = {
+                    "scope_id": node_id,
+                    "from_status": current_status,
+                    "to_status": target_status,
+                }
+                if agent_id is not None:
+                    payload["agent_id"] = agent_id
+                if trigger is not None:
+                    payload["trigger"] = trigger
+                audit_events.append(build_audit_event("scope_status_changed", now, **payload))
+            changed = True
+
+    return transitions
 
 
 def extend_lease(node: Dict, now: datetime) -> None:
@@ -225,10 +306,38 @@ def clear_worker(node: Dict) -> None:
 
 def reset_runtime_fields(node: Dict) -> None:
     clear_worker(node)
+    node.pop("owner_id", None)
     node.pop("started_at", None)
     node.pop("completed_at", None)
     node["artifacts"] = []
     node["report"] = ""
+
+
+def current_owner(node: Dict) -> Optional[str]:
+    return node.get("owner_id") or node.get("worker_id")
+
+
+def assert_owned_by_agent(
+    node: Dict, node_id: str, agent_id: str, *, adopt_unowned_terminal: bool = False
+) -> None:
+    owner_id = current_owner(node)
+    if owner_id is None and adopt_unowned_terminal and node.get("status") in TERMINAL_STATUSES:
+        node["owner_id"] = agent_id
+        return
+    if owner_id != agent_id:
+        owner_text = owner_id or "unowned"
+        raise ValueError(f"Node {node_id} is owned by {owner_text}; agent_id={agent_id} cannot mutate it.")
+
+
+def assert_claimed_by_agent(node: Dict, node_id: str, agent_id: str) -> None:
+    worker_id = node.get("worker_id")
+    if worker_id != agent_id:
+        worker_text = worker_id or "unassigned"
+        raise ValueError(f"Node {node_id} is claimed by {worker_text}; agent_id={agent_id} cannot mutate it.")
+
+
+def format_scope_transitions(transitions: List[Tuple[str, str, str]]) -> str:
+    return ", ".join(f"{node_id}[{to_status}]" for node_id, _, to_status in transitions)
 
 
 def format_dependency_context(nodes: Dict[str, Dict], node: Dict) -> str:
@@ -267,6 +376,7 @@ def claim_ready_nodes(graph: Dict, agent_id: str, now: datetime) -> Tuple[Option
     # Re-entry: return the node already claimed by this agent.
     for node_id, node in nodes.items():
         if node.get("worker_id") == agent_id and node["status"] == "CLAIMED":
+            node["owner_id"] = agent_id
             extend_lease(node, now)
             return node_id, format_assignment(node_id, node, nodes)
 
@@ -288,6 +398,7 @@ def claim_ready_nodes(graph: Dict, agent_id: str, now: datetime) -> Tuple[Option
     node_id, node = ready_nodes[0]
     node["status"] = "CLAIMED"
     node["worker_id"] = agent_id
+    node["owner_id"] = agent_id
     node["started_at"] = isoformat(now)
     extend_lease(node, now)
     return node_id, format_assignment(node_id, node, nodes)
@@ -306,7 +417,9 @@ def atp_claim_task(plan_path: str, agent_id: str) -> str:
 
         revived = release_zombie_claims(graph, now)
         unblocked = refresh_ready_nodes(graph)
-        closed_scopes = maybe_complete_scopes(graph, now)
+        scope_transitions = recompute_scope_statuses(
+            graph, now, audit_events, agent_id=agent_id, trigger="claim"
+        )
         scope_unblocked = refresh_ready_nodes(graph)
         node_id, message = claim_ready_nodes(graph, agent_id, now)
 
@@ -323,7 +436,10 @@ def atp_claim_task(plan_path: str, agent_id: str) -> str:
                     node_id=node_id,
                     recovered_nodes=revived,
                     newly_ready=unblocked,
-                    completed_scopes=closed_scopes,
+                    scope_updates=[
+                        {"scope_id": scope_id, "from_status": old_status, "to_status": new_status}
+                        for scope_id, old_status, new_status in scope_transitions
+                    ],
                     ready_after_scope=scope_unblocked,
                 )
             )
@@ -336,10 +452,10 @@ def atp_claim_task(plan_path: str, agent_id: str) -> str:
         extra.append(f"Recovered stale tasks: {', '.join(revived)}.")
     if unblocked:
         extra.append(f"Newly READY: {', '.join(unblocked)}.")
-    if closed_scopes:
-        extra.append(f"Scopes completed: {', '.join(closed_scopes)}.")
+    if scope_transitions:
+        extra.append(f"Scope updates: {format_scope_transitions(scope_transitions)}.")
     if scope_unblocked:
-        extra.append(f"READY after scope closure: {', '.join(scope_unblocked)}.")
+        extra.append(f"READY after scope updates: {', '.join(scope_unblocked)}.")
     suffix = " " + " ".join(extra) if extra else ""
     return message + suffix
 
@@ -360,6 +476,7 @@ def normalize_completion_status(status: str) -> str:
 def atp_complete_task(
     plan_path: str,
     node_id: str,
+    agent_id: str,
     report: str,
     artifacts: Optional[List[str]] = None,
     status: str = "DONE",
@@ -379,45 +496,47 @@ def atp_complete_task(
             raise ValueError("Scope nodes close automatically once their children are done.")
         if node["status"] != "CLAIMED":
             raise ValueError(f"Node {node_id} must be CLAIMED before completion; current status={node['status']}.")
+        assert_claimed_by_agent(node, node_id, agent_id)
 
+        node["owner_id"] = agent_id
         node["status"] = new_status
         node["report"] = report.strip()
         node["artifacts"] = artifacts or []
         node["completed_at"] = isoformat(now)
         clear_worker(node)
 
-        if new_status == "FAILED":
-            audit_events.append(
-                build_audit_event(
-                    "task_completed",
-                    now,
-                    node_id=node_id,
-                    status=new_status,
-                    artifacts=node["artifacts"],
-                    report=node["report"],
-                )
-            )
-            return f"Task {node_id} marked as FAILED. Dependent tasks remain blocked."
-
-        unblocked = refresh_ready_nodes(graph)
-        closed_scopes = maybe_complete_scopes(graph, now)
+        scope_transitions = recompute_scope_statuses(
+            graph, now, audit_events, agent_id=agent_id, trigger="complete"
+        )
         ready_after_parent = refresh_ready_nodes(graph)
-        newly_ready = list(dict.fromkeys(unblocked + closed_scopes + ready_after_parent))
+        newly_ready = list(dict.fromkeys(ready_after_parent))
         audit_events.append(
             build_audit_event(
                 "task_completed",
                 now,
+                agent_id=agent_id,
                 node_id=node_id,
                 status=new_status,
                 artifacts=node["artifacts"],
                 report=node["report"],
                 newly_ready=newly_ready,
+                scope_updates=[
+                    {"scope_id": scope_id, "from_status": old_status, "to_status": new_status}
+                    for scope_id, old_status, new_status in scope_transitions
+                ],
             )
         )
 
+    scope_suffix = (
+        f" Scope updates: {format_scope_transitions(scope_transitions)}."
+        if scope_transitions
+        else ""
+    )
+    if new_status == "FAILED":
+        return f"Task {node_id} marked as FAILED. Dependent tasks remain blocked.{scope_suffix}"
     if newly_ready:
-        return f"Task {node_id} completed. Newly READY: {', '.join(newly_ready)}."
-    return f"Task {node_id} completed. No downstream tasks were unblocked."
+        return f"Task {node_id} completed.{scope_suffix} Newly READY: {', '.join(newly_ready)}."
+    return f"Task {node_id} completed.{scope_suffix} No downstream tasks were unblocked."
 
 
 def validate_subtasks(subtasks: List[Dict]) -> None:
@@ -440,28 +559,7 @@ def validate_subtasks(subtasks: List[Dict]) -> None:
         raise ValueError("Provide at least one subtask.")
 
     adjacency: Dict[str, List[str]] = {task["id"]: task.get("dependencies", []) for task in subtasks}
-    visited: Dict[str, str] = {}
-
-    for root_id in adjacency:
-        if visited.get(root_id) is not None:
-            continue
-        visited[root_id] = "VISITING"
-        stack: List[Tuple[str, Any]] = [(root_id, iter(adjacency.get(root_id, [])))]
-        while stack:
-            node_id, deps_iter = stack[-1]
-            try:
-                dep_id = next(deps_iter)
-            except StopIteration:
-                visited[node_id] = "VISITED"
-                stack.pop()
-                continue
-
-            state = visited.get(dep_id)
-            if state == "VISITING":
-                raise ValueError("Subtasks contain a cycle.")
-            if state is None:
-                visited[dep_id] = "VISITING"
-                stack.append((dep_id, iter(adjacency.get(dep_id, []))))
+    ensure_acyclic(adjacency, "Subtasks")
 
 
 def graft_subgraph(
@@ -476,6 +574,11 @@ def graft_subgraph(
     validate_subtasks(subtasks)
 
     new_ids = [task["id"] for task in subtasks]
+    collisions = sorted(task_id for task_id in new_ids if task_id in nodes)
+    if collisions:
+        raise ValueError(
+            f"Subtask IDs already exist in the plan and cannot be reused: {', '.join(collisions)}"
+        )
     subgraph_dependencies = {task["id"]: task.get("dependencies", []) for task in subtasks}
     dependents: Dict[str, List[str]] = {tid: [] for tid in new_ids}
     for node_id, deps in subgraph_dependencies.items():
@@ -505,6 +608,8 @@ def graft_subgraph(
     parent["type"] = "SCOPE"
     parent["status"] = "CLAIMED"
     parent["scope_children"] = new_ids
+    if parent.get("worker_id"):
+        parent["owner_id"] = parent["worker_id"]
     clear_worker(parent)
     parent.setdefault("started_at", isoformat(now))
 
@@ -518,7 +623,9 @@ def graft_subgraph(
 
 
 @mcp.tool()
-def atp_decompose_task(plan_path: str, parent_id: str, subtasks: List[Dict]) -> str:
+def atp_decompose_task(
+    plan_path: str, parent_id: str, subtasks: List[Dict], agent_id: Optional[str] = None
+) -> str:
     """
     Decomposes a task into a new subgraph and converts the parent into a scope.
     """
@@ -532,27 +639,42 @@ def atp_decompose_task(plan_path: str, parent_id: str, subtasks: List[Dict]) -> 
             raise ValueError(f"Node {parent_id} is already a scope.")
         if parent["status"] not in {"CLAIMED", "READY"}:
             raise ValueError(f"Node {parent_id} must be CLAIMED or READY to decompose.")
+        if parent["status"] == "CLAIMED":
+            if not agent_id:
+                raise ValueError("agent_id is required to decompose a CLAIMED node.")
+            assert_claimed_by_agent(parent, parent_id, agent_id)
 
         start_nodes, end_nodes = graft_subgraph(graph, parent_id, subtasks, now)
-        closed_scopes = maybe_complete_scopes(graph, now)
+        scope_transitions = recompute_scope_statuses(
+            graph, now, audit_events, agent_id=agent_id, trigger="decompose"
+        )
         refresh_ready_nodes(graph)
         audit_events.append(
             build_audit_event(
                 "task_decomposed",
                 now,
+                agent_id=agent_id,
                 parent_id=parent_id,
                 subtask_ids=[task["id"] for task in subtasks],
                 start_nodes=start_nodes,
                 end_nodes=end_nodes,
-                completed_scopes=closed_scopes,
+                scope_updates=[
+                    {"scope_id": scope_id, "from_status": old_status, "to_status": new_status}
+                    for scope_id, old_status, new_status in scope_transitions
+                ],
             )
         )
 
+    scope_suffix = (
+        f" Scope updates: {format_scope_transitions(scope_transitions)}."
+        if scope_transitions
+        else " Scope updates: none."
+    )
     return (
         "Decomposition successful. Parent converted to SCOPE and will close after children finish. "
         f"Start nodes: {', '.join(start_nodes)}. End nodes: {', '.join(end_nodes)}. "
         f"You are released; call 'atp_claim_task' to continue. "
-        f"Scopes closed during this operation: {', '.join(closed_scopes) if closed_scopes else 'none'}."
+        f"{scope_suffix}"
     )
 
 
@@ -645,7 +767,7 @@ def atp_read_graph(plan_path: str, view_mode: str = "full", node_id: Optional[st
 
 
 @mcp.tool()
-def atp_reset_task(plan_path: str, node_id: str, reason: str) -> str:
+def atp_reset_task(plan_path: str, node_id: str, agent_id: str, reason: str) -> str:
     """
     Resets a FAILED node back to READY so it can be claimed again.
     """
@@ -659,25 +781,39 @@ def atp_reset_task(plan_path: str, node_id: str, reason: str) -> str:
             raise ValueError("Scope nodes cannot be reset manually.")
         if node["status"] != "FAILED":
             raise ValueError(f"Node {node_id} must be FAILED to reset; current status={node['status']}.")
+        assert_owned_by_agent(node, node_id, agent_id, adopt_unowned_terminal=True)
 
         node["status"] = "READY"
         reset_runtime_fields(node)
+        scope_transitions = recompute_scope_statuses(
+            graph, now, audit_events, agent_id=agent_id, trigger="reset"
+        )
         audit_events.append(
             build_audit_event(
                 "task_reset",
                 now,
+                agent_id=agent_id,
                 node_id=node_id,
                 from_status="FAILED",
                 to_status="READY",
                 reason=reason.strip(),
+                scope_updates=[
+                    {"scope_id": scope_id, "from_status": old_status, "to_status": new_status}
+                    for scope_id, old_status, new_status in scope_transitions
+                ],
             )
         )
 
-    return f"Task {node_id} reset to READY. Reason recorded: {reason.strip() or '(none)'}."
+    scope_suffix = (
+        f" Scope updates: {format_scope_transitions(scope_transitions)}."
+        if scope_transitions
+        else ""
+    )
+    return f"Task {node_id} reset to READY.{scope_suffix} Reason recorded: {reason.strip() or '(none)'}."
 
 
 @mcp.tool()
-def atp_cancel_task(plan_path: str, node_id: str, reason: str) -> str:
+def atp_cancel_task(plan_path: str, node_id: str, agent_id: str, reason: str) -> str:
     """
     Cancels a node and leaves its dependents blocked until the graph is changed.
     """
@@ -689,26 +825,45 @@ def atp_cancel_task(plan_path: str, node_id: str, reason: str) -> str:
         node = nodes[node_id]
         if node.get("type") == "SCOPE":
             raise ValueError("Scope nodes cannot be cancelled manually.")
-        if node["status"] in {"COMPLETED", "CANCELLED"}:
-            raise ValueError(f"Node {node_id} cannot be cancelled from status={node['status']}.")
+        if node["status"] not in {"CLAIMED", "FAILED"}:
+            raise ValueError(
+                f"Node {node_id} can be cancelled only from CLAIMED or FAILED; current status={node['status']}."
+            )
+        assert_owned_by_agent(node, node_id, agent_id, adopt_unowned_terminal=True)
+        if node["status"] == "CLAIMED":
+            assert_claimed_by_agent(node, node_id, agent_id)
 
         previous_status = node["status"]
         node["status"] = "CANCELLED"
+        node["owner_id"] = agent_id
         clear_worker(node)
         node["completed_at"] = isoformat(now)
+        scope_transitions = recompute_scope_statuses(
+            graph, now, audit_events, agent_id=agent_id, trigger="cancel"
+        )
         audit_events.append(
             build_audit_event(
                 "task_cancelled",
                 now,
+                agent_id=agent_id,
                 node_id=node_id,
                 from_status=previous_status,
                 to_status="CANCELLED",
                 reason=reason.strip(),
+                scope_updates=[
+                    {"scope_id": scope_id, "from_status": old_status, "to_status": new_status}
+                    for scope_id, old_status, new_status in scope_transitions
+                ],
             )
         )
 
+    scope_suffix = (
+        f" Scope updates: {format_scope_transitions(scope_transitions)}."
+        if scope_transitions
+        else ""
+    )
     return (
-        f"Task {node_id} cancelled. Dependents remain blocked until the graph is updated. "
+        f"Task {node_id} cancelled.{scope_suffix} Dependents remain blocked until the graph is updated. "
         f"Reason recorded: {reason.strip() or '(none)'}."
     )
 
