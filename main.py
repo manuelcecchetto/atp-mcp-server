@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 from contextlib import contextmanager
@@ -95,6 +97,21 @@ def save_graph(graph: Dict, plan_file: Path) -> None:
     plan_file.write_text(json.dumps(graph, indent=2) + "\n")
 
 
+def compute_graph_version(graph: Dict) -> str:
+    snapshot = copy.deepcopy(graph)
+    meta = snapshot.get("meta")
+    if isinstance(meta, dict):
+        meta.pop("graph_version", None)
+    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def graph_with_runtime_meta(graph: Dict) -> Dict:
+    snapshot = copy.deepcopy(graph)
+    snapshot.setdefault("meta", {})["graph_version"] = compute_graph_version(graph)
+    return snapshot
+
+
 @contextmanager
 def locked_graph(plan_path: str) -> Iterable[Dict]:
     plan_file, lock_file = resolve_paths(plan_path)
@@ -109,6 +126,14 @@ def dependencies_satisfied(nodes: Dict[str, Dict], dependencies: List[str]) -> b
     return all(nodes[dep]["status"] == "COMPLETED" for dep in dependencies)
 
 
+def node_is_closed(node: Dict) -> bool:
+    return node.get("future_state") in {"CLOSED", "SUPERSEDED"}
+
+
+def node_is_mutable_future(node: Dict) -> bool:
+    return node.get("type") != "SCOPE" and not node_is_closed(node) and node["status"] in {"READY", "LOCKED"}
+
+
 def find_children(nodes: Dict[str, Dict], node_id: str) -> List[str]:
     return [nid for nid, node in nodes.items() if node_id in node.get("dependencies", [])]
 
@@ -118,6 +143,8 @@ def refresh_ready_nodes(graph: Dict) -> List[str]:
     nodes = graph["nodes"]
     for node_id, node in nodes.items():
         if node.get("type") == "SCOPE":
+            continue
+        if node_is_closed(node):
             continue
         if node["status"] != "LOCKED":
             continue
@@ -218,7 +245,7 @@ def claim_ready_nodes(graph: Dict, agent_id: str, now: datetime) -> Tuple[Option
     ready_nodes = [
         (node_id, node)
         for node_id, node in nodes.items()
-        if node["status"] == "READY" and node.get("type") != "SCOPE"
+        if node["status"] == "READY" and node.get("type") != "SCOPE" and not node_is_closed(node)
     ]
     if not ready_nodes:
         return None, "NO_TASKS_AVAILABLE: All tasks are blocked, claimed, or the project is finished."
@@ -434,11 +461,216 @@ def atp_decompose_task(plan_path: str, parent_id: str, subtasks: List[Dict]) -> 
     )
 
 
+def claimed_node_count(graph: Dict) -> int:
+    return sum(1 for node in graph.get("nodes", {}).values() if node["status"] == "CLAIMED")
+
+
+def normalize_future_status(value: Optional[str]) -> str:
+    if value is None:
+        return "LOCKED"
+    status = value.upper()
+    if status not in {"LOCKED", "READY"}:
+        raise ValueError("Future patch node status must be LOCKED or READY.")
+    return status
+
+
+def ensure_patch_ids_unique(add_nodes: List[Dict]) -> None:
+    ids = [node["id"] for node in add_nodes]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Patch add_nodes entries must have unique IDs.")
+
+
+def ensure_dependencies_known(
+    dependencies: List[str], known_ids: set[str], field_name: str, node_id: str
+) -> None:
+    unknown = [dep for dep in dependencies if dep not in known_ids]
+    if unknown:
+        raise ValueError(
+            f"{field_name} for {node_id} references unknown dependencies: {', '.join(unknown)}"
+        )
+
+
+def recompute_future_readiness(graph: Dict) -> None:
+    nodes = graph["nodes"]
+    for node in nodes.values():
+        if node.get("type") == "SCOPE" or node_is_closed(node):
+            continue
+        if node["status"] in {"READY", "LOCKED"}:
+            node["status"] = (
+                "READY" if dependencies_satisfied(nodes, node.get("dependencies", [])) else "LOCKED"
+            )
+
+
+def ensure_no_active_dependency_on_closed_node(graph: Dict) -> None:
+    nodes = graph["nodes"]
+    closed_ids = {node_id for node_id, node in nodes.items() if node_is_closed(node)}
+    if not closed_ids:
+        return
+    offenders: List[str] = []
+    for node_id, node in nodes.items():
+        if node_id in closed_ids or node["status"] in {"COMPLETED", "FAILED"}:
+            continue
+        for dep in node.get("dependencies", []):
+            if dep in closed_ids:
+                offenders.append(f"{node_id}->{dep}")
+    if offenders:
+        raise ValueError(
+            "Future patch leaves active nodes depending on closed nodes: "
+            + ", ".join(sorted(offenders))
+        )
+
+
+def apply_future_patch_to_graph(
+    graph: Dict, patch: Dict, reason: str, actor_id: str, now: datetime
+) -> Dict[str, int]:
+    nodes = graph["nodes"]
+    add_nodes = patch.get("add_nodes", []) or []
+    update_nodes = patch.get("update_nodes", []) or []
+    close_nodes = patch.get("close_nodes", []) or []
+    rewire_edges = patch.get("rewire_edges", []) or []
+
+    ensure_patch_ids_unique(add_nodes)
+    new_ids = {node["id"] for node in add_nodes}
+    collisions = sorted(node_id for node_id in new_ids if node_id in nodes)
+    if collisions:
+        raise ValueError(
+            "Future patch add_nodes contains IDs already present in graph: " + ", ".join(collisions)
+        )
+
+    known_ids = set(nodes.keys()) | new_ids
+    patch_timestamp = isoformat(now)
+
+    for payload in add_nodes:
+        node_id = payload["id"]
+        dependencies = list(payload.get("dependencies", []))
+        ensure_dependencies_known(dependencies, known_ids, "dependencies", node_id)
+        nodes[node_id] = {
+            "title": payload["title"],
+            "instruction": payload["instruction"],
+            "dependencies": dependencies,
+            "status": normalize_future_status(payload.get("status")),
+            "reasoning_effort": payload.get("reasoning_effort", "medium"),
+            "future_patch_reason": reason,
+            "future_patched_at": patch_timestamp,
+            "future_patched_by": actor_id,
+        }
+        if payload.get("context"):
+            nodes[node_id]["context"] = payload["context"]
+
+    for payload in update_nodes:
+        node_id = payload["id"]
+        if node_id not in nodes:
+            raise ValueError(f"Cannot update missing node {node_id}.")
+        node = nodes[node_id]
+        if not node_is_mutable_future(node):
+            raise ValueError(f"Node {node_id} is not a mutable future node.")
+        for field in ("title", "instruction", "reasoning_effort"):
+            if field in payload:
+                node[field] = payload[field]
+        if "context" in payload:
+            if payload["context"] in (None, ""):
+                node.pop("context", None)
+            else:
+                node["context"] = payload["context"]
+        if "status" in payload:
+            node["status"] = normalize_future_status(payload["status"])
+        node["future_patch_reason"] = reason
+        node["future_patched_at"] = patch_timestamp
+        node["future_patched_by"] = actor_id
+
+    for payload in rewire_edges:
+        node_id = payload.get("id") or payload.get("node_id")
+        if not node_id or node_id not in nodes:
+            raise ValueError(f"Cannot rewire missing node {node_id}.")
+        node = nodes[node_id]
+        if not node_is_mutable_future(node):
+            raise ValueError(f"Node {node_id} is not a mutable future node.")
+        dependencies = list(payload.get("dependencies", []))
+        ensure_dependencies_known(dependencies, known_ids, "rewire dependencies", node_id)
+        node["dependencies"] = dependencies
+        node["future_patch_reason"] = reason
+        node["future_patched_at"] = patch_timestamp
+        node["future_patched_by"] = actor_id
+
+    for payload in close_nodes:
+        if isinstance(payload, str):
+            node_id = payload
+            future_state = "SUPERSEDED"
+            superseded_by = None
+        else:
+            node_id = payload["id"]
+            future_state = payload.get("future_state", "SUPERSEDED")
+            superseded_by = payload.get("superseded_by")
+        if node_id not in nodes:
+            raise ValueError(f"Cannot close missing node {node_id}.")
+        node = nodes[node_id]
+        if not node_is_mutable_future(node):
+            raise ValueError(f"Node {node_id} is not a mutable future node.")
+        node["future_state"] = future_state
+        node["future_patch_reason"] = reason
+        node["future_patched_at"] = patch_timestamp
+        node["future_patched_by"] = actor_id
+        if superseded_by:
+            node["superseded_by"] = superseded_by
+
+    recompute_future_readiness(graph)
+    ensure_no_active_dependency_on_closed_node(graph)
+    refresh_ready_nodes(graph)
+
+    return {
+        "add_nodes": len(add_nodes),
+        "update_nodes": len(update_nodes),
+        "close_nodes": len(close_nodes),
+        "rewire_edges": len(rewire_edges),
+    }
+
+
+@mcp.tool()
+def atp_apply_future_patch(
+    plan_path: str,
+    expected_graph_version: str,
+    patch: Dict,
+    reason: str,
+    actor_id: str,
+) -> str:
+    """
+    Applies a bounded future-graph patch when no nodes are currently claimed.
+    """
+    now = utc_now()
+    with locked_graph(plan_path) as graph:
+        current_graph_version = compute_graph_version(graph)
+        if current_graph_version != expected_graph_version:
+            raise ValueError(
+                "Graph version mismatch. "
+                f"expected_graph_version={expected_graph_version}, current_graph_version={current_graph_version}"
+            )
+        if claimed_node_count(graph) != 0:
+            raise ValueError("Future patch apply requires zero_claimed nodes.")
+
+        candidate = copy.deepcopy(graph)
+        summary = apply_future_patch_to_graph(candidate, patch, reason.strip(), actor_id, now)
+        validate_graph(candidate)
+        graph.clear()
+        graph.update(candidate)
+        next_graph_version = compute_graph_version(graph)
+
+    return (
+        "Future patch applied. "
+        f"graph_version: {expected_graph_version} -> {next_graph_version}. "
+        f"add_nodes={summary['add_nodes']}, update_nodes={summary['update_nodes']}, "
+        f"close_nodes={summary['close_nodes']}, rewire_edges={summary['rewire_edges']}."
+    )
+
+
 def summarize_status(graph: Dict) -> str:
     nodes = graph.get("nodes", {})
     counts: Dict[str, int] = {"LOCKED": 0, "READY": 0, "CLAIMED": 0, "COMPLETED": 0, "FAILED": 0}
     claimed: List[str] = []
+    closed_count = 0
     for node_id, node in nodes.items():
+        if node_is_closed(node):
+            closed_count += 1
+            continue
         status = node["status"]
         counts[status] = counts.get(status, 0) + 1
         if status == "CLAIMED":
@@ -449,12 +681,15 @@ def summarize_status(graph: Dict) -> str:
     )
     lines = [
         headline,
+        f"Graph version: {compute_graph_version(graph)}",
         f"READY: {counts['READY']} | CLAIMED: {counts['CLAIMED']} | COMPLETED: {counts['COMPLETED']} | FAILED: {counts['FAILED']}",
     ]
+    if closed_count:
+        lines.append(f"Closed future nodes: {closed_count}")
     if claimed:
         lines.append("Claimed tasks:")
         lines.extend([f"- {entry}" for entry in claimed])
-    ready = [nid for nid, node in nodes.items() if node["status"] == "READY"]
+    ready = [nid for nid, node in nodes.items() if node["status"] == "READY" and not node_is_closed(node)]
     if ready:
         lines.append("Ready to start:")
         lines.extend([f"- {nid}: {nodes[nid]['title']}" for nid in ready])
@@ -483,11 +718,14 @@ def render_local_view(graph: Dict, center: str) -> str:
     parents = node.get("dependencies", [])
     children = find_children(nodes, center)
     lines = [
+        f"Graph version: {compute_graph_version(graph)}",
         f"{center}: {node['title']} [{node['status']}]",
         f"Instruction: {node['instruction']}",
         f"Dependencies: {', '.join(parents) if parents else 'None'}",
         f"Children: {', '.join(children) if children else 'None'}",
     ]
+    if node_is_closed(node):
+        lines.append(f"Future state: {node.get('future_state')}")
     for dep_id in parents:
         parent = nodes[dep_id]
         lines.append(f"- Parent {dep_id} [{parent['status']}]: {parent.get('report') or 'no report'}")
@@ -504,7 +742,7 @@ def atp_read_graph(plan_path: str, view_mode: str = "full", node_id: Optional[st
     """
     graph = load_graph(resolve_paths(plan_path)[0])
     if view_mode == "full":
-        return json.dumps(graph, indent=2)
+        return json.dumps(graph_with_runtime_meta(graph), indent=2)
     if view_mode == "local":
         if not node_id:
             raise ValueError("node_id is required for local view.")

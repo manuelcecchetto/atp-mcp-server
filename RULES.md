@@ -27,5 +27,7 @@ Tool quick reference
 - `atp_claim_task(plan_path, agent_id)`: Recover stale claims, then CLAIM the highest-priority READY node. Returns instruction plus parent reports.
 - `atp_complete_task(plan_path, node_id, report, artifacts=[], status="DONE")`: Mark DONE/FAILED, clear lease, and READY children whose deps are satisfied.
 - `atp_decompose_task(plan_path, parent_id, subtasks)`: Split a task into a subgraph; parent becomes a SCOPE and auto-closes when children finish.
+- `atp_apply_future_patch(plan_path, expected_graph_version, patch, reason, actor_id)`: ATP v1.4 future-graph mutation tool. Use only for adaptive-judge style updates to future work; apply is rejected unless claimed-node count is zero and the graph version matches.
 - `atp_read_graph(plan_path, view_mode="full"|"local", node_id=None)`: Return full plan JSON or a neighborhood view.
+- `atp_read_graph(..., view_mode="full")` returns runtime `meta.graph_version`; use that as the optimistic-concurrency token for future patch apply.
 - Resource: `atp://status/summary` gives a read-only snapshot for the default plan configured on the server side.

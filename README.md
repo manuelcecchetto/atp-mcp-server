@@ -48,6 +48,7 @@ Available tools
 - `atp_claim_task(plan_path, agent_id)`: Assigns the highest-priority READY node, recovers zombies, and returns dependency context. Re-enters an existing claim for the same agent.
 - `atp_complete_task(plan_path, node_id, report, artifacts=[], status="DONE")`: Marks a task DONE or FAILED, clears the lease, and unlocks children whose dependencies are satisfied.
 - `atp_decompose_task(plan_path, parent_id, subtasks)`: Converts a task into a SCOPE with a new subgraph. Subtasks must form a DAG; start nodes inherit the parent’s original dependencies. The parent closes automatically once all new tasks complete.
+- `atp_apply_future_patch(plan_path, expected_graph_version, patch, reason, actor_id)`: Applies bounded future-graph mutations for ATP v1.4 adaptive judge flows. Apply is rejected unless claimed-node count is zero, the graph version matches, terminal/claimed nodes remain untouched, and the candidate graph stays valid.
 - `atp_read_graph(plan_path, view_mode="full" | "local", node_id=None)`: Returns the full JSON graph or a neighborhood view around `node_id`.
 
 Resource
@@ -60,6 +61,8 @@ Graph contract
 
 - Keep the plan as a valid task DAG: each node has `title`, `instruction`, `dependencies`, `status` (`LOCKED|READY|CLAIMED|COMPLETED|FAILED`), plus optional `context`, `reasoning_effort` (`minimal|low|medium|high|xhigh`), `artifacts`, `report`, timestamps.
 - Node statuses: `LOCKED` (waiting), `READY`, `CLAIMED`, `COMPLETED`, `FAILED`. The server will auto-release CLAIMED tasks after the lease window and auto-complete SCOPE nodes produced by `atp_decompose_task` once all `scope_children` finish.
+- `atp_read_graph(..., view_mode="full")` includes runtime `meta.graph_version` in its response payload for optimistic concurrency in adaptive judge flows.
+- ATP v1.4 future-graph mutation is additive. Closed/superseded future nodes are tracked via optional metadata and are not claimable or counted as READY work.
 - Dependency integrity is checked on every read/write; missing node references will raise errors instead of silently mutating the file.
 
 Testing
